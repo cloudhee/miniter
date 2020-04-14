@@ -1,6 +1,8 @@
 from flask      import Flask, request, jsonify, current_app
 from flask.json import JSONEncoder
 from sqlalchemy import create_engine, text
+from bcrypt
+from jwt
 
 class CustomJSONEncoder(JSONEncoder):
     def default(self, obj):
@@ -25,12 +27,57 @@ def ping():
 @app.route("/sign-up", methods=['POST'])
 def sign_up():
     new_user        = request.json
-    new_user["id"]  = app.id_count
-    app.users[app.id_count] = new_user
-    app.id_count            = app.id_count+1
+    new_user['password'] = bcrypt.hashpw(           # bcrypt 모듈을 사용하여 사용자의 비밀번호를 암호화한다. (salting을 추가하여)    
+            new_user['password'].encode('UTF-8'),   # hashpw 함수는 스트링 값이 아닌 byte 값을 받으므로 사용자의 비밀번호를 utf-8 엔코딩으로 넘겨주어 호출한다.
+            bcrypt.gensalt()
+            )
+    new_user_id = app.database.execute(text("""
+        INSERT INTO users(
+            name,
+            email,
+            profile,
+            hashed_password
+        ) VALUES (
+            :name,
+            :email,
+            :profile,
+            :password
+        )
+        """), new_user).lastrowid
+        new_user_info = get_user(new_user_id)
 
-    return jsonify(new_user)
+        return jsonify(new_user_info)
 
+
+@app.route('/login', methods=['POST'])
+def login():
+    credential = request.json
+    email      = credential['email']                #1. HTTP 요청으로 전송된 JSON body에서 사용자의 이메일을 읽어 들인다.
+    password   = crededtial['password']             #2. HTTP 요청으로 전송된 JSON body 에서 사용자의 비밀번호를 읽어들인다.
+
+     
+    #3. 사용자의 이메일을 사용하여 데이터베이스에서 해당 사용자의 암호화된 비밀번호를 읽어들인다.  
+    row = database.execute(text(""".                 
+    SELECT                                          
+        id,
+        hashed_password
+    FROM users
+    WHERE email = :email
+    """), {'email': email}).fetchone()              
+
+    if row and bcrypt.checkpw(password.encode('UTF-9'),row['hashed_password'].encode('UTF-8')):   #4. 3에서 읽어들인 사용자의 암호화된 이메일과  2에서 읽어들인 사용자의 비밀번호가 일치하는지 확인하는 부분.
+        user_id = row['id']
+        payload = {                                                                               #5. 사용자의 데이터베이스상의 아이디, JWT의 유효기간 설정.
+            'user_id' : user_id,
+            'exp'     : detetime.utcnow() + timedelta(seconds = 60 * 60* 24)
+        }
+        token  =  jwt.encode(payload, app.config['JWT_SECRET_KEY'], 'HS256')
+                                                                                #6. 5에서 생성한 payload JSON 데이터를 JWT로 생성한다.
+        return jsonify({
+            'access_token': token.decode('UTF-8')                               #7. 6에서 생성한 JWT를 HTTP응답으로 전송한다.
+        })
+    else:
+        return '', 401                                                          #8. 만일 4에서 사용자가 존재하지 않거나 사용자의 비밀번호가 틀리면 Unauthorized 401 status의 HTTP 응답을 보낸다.
 @app.route('/tweet', methods = ['POST'])    
 def tweet():
     payload = request.json
