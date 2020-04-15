@@ -1,38 +1,45 @@
-from flask      import Flask, request, jsonify, current_app
+import jwt
+import bcrypt
+
+from flask      import Flask, request, jsonify, current_app, Response, g
 from flask.json import JSONEncoder
 from sqlalchemy import create_engine, text
-from bcrypt
-from jwt
+from datetime   import datetime, timedelta
+from functools  import wraps
 
+## Default JSON encoder는 set를 JSON으로 변환할 수 없다.
+## 그러므로 커스텀 엔코더를 작성해서 set을 list로 변환하여
+## JSON으로 변환 가능하게 해주어야 한다.
 class CustomJSONEncoder(JSONEncoder):
     def default(self, obj):
         if isinstance(obj, set):
             return list(obj)
 
-        return JSONEcoder.default(self, obj)
-    
+        return JSONEncoder.default(self, obj)
 
-app = Flask(__name__)
+def get_user(user_id):
+    user = current_app.database.execute(text("""
+        SELECT 
+            id,
+            name,
+            email,
+            profile
+        FROM users
+        WHERE id = :user_id
+    """), {
+        'user_id' : user_id 
+    }).fetchone()
 
-app.id_count = 1
-app.users    = {}
-app.tweets   = []
-app.json_encoder = CustomJSONEncoder
+    return {
+        'id'      : user['id'],
+        'name'    : user['name'],
+        'email'   : user['email'],
+        'profile' : user['profile']
+    } if user else None
 
-
-@app.route("/ping", methods = ['GET'])
-def ping():
-    return "pong"
-
-@app.route("/sign-up", methods=['POST'])
-def sign_up():
-    new_user        = request.json
-    new_user['password'] = bcrypt.hashpw(           # bcrypt 모듈을 사용하여 사용자의 비밀번호를 암호화한다. (salting을 추가하여)    
-            new_user['password'].encode('UTF-8'),   # hashpw 함수는 스트링 값이 아닌 byte 값을 받으므로 사용자의 비밀번호를 utf-8 엔코딩으로 넘겨주어 호출한다.
-            bcrypt.gensalt()
-            )
-    new_user_id = app.database.execute(text("""
-        INSERT INTO users(
+def insert_user(user):
+    return current_app.database.execute(text("""
+        INSERT INTO users (
             name,
             email,
             profile,
@@ -43,101 +50,184 @@ def sign_up():
             :profile,
             :password
         )
-        """), new_user).lastrowid
-        new_user_info = get_user(new_user_id)
+    """), user).lastrowid
 
-        return jsonify(new_user_info)
+def insert_tweet(user_tweet):
+    return current_app.database.execute(text("""
+        INSERT INTO tweets (
+            user_id,
+            tweet
+        ) VALUES (
+            :id,
+            :tweet
+        )
+    """), user_tweet).rowcount
 
+def insert_follow(user_follow):
+    return current_app.database.execute(text("""
+        INSERT INTO users_follow_list (
+            user_id,
+            follow_user_id
+        ) VALUES (
+            :id,
+            :follow
+        )
+    """), user_follow).rowcount
 
-@app.route('/login', methods=['POST'])
-def login():
-    credential = request.json
-    email      = credential['email']                #1. HTTP 요청으로 전송된 JSON body에서 사용자의 이메일을 읽어 들인다.
-    password   = crededtial['password']             #2. HTTP 요청으로 전송된 JSON body 에서 사용자의 비밀번호를 읽어들인다.
+def insert_unfollow(user_unfollow):
+    return current_app.database.execute(text("""
+        DELETE FROM users_follow_list
+        WHERE user_id = :id
+        AND follow_user_id = :unfollow
+    """), user_unfollow).rowcount
 
-     
-    #3. 사용자의 이메일을 사용하여 데이터베이스에서 해당 사용자의 암호화된 비밀번호를 읽어들인다.  
-    row = database.execute(text(""".                 
-    SELECT                                          
-        id,
-        hashed_password
-    FROM users
-    WHERE email = :email
-    """), {'email': email}).fetchone()              
+def get_timeline(user_id):
+    timeline = current_app.database.execute(text("""
+        SELECT 
+            t.user_id,
+            t.tweet
+        FROM tweets t
+        LEFT JOIN users_follow_list ufl ON ufl.user_id = :user_id
+        WHERE t.user_id = :user_id 
+        OR t.user_id = ufl.follow_user_id
+    """), {
+        'user_id' : user_id 
+    }).fetchall()
 
-    if row and bcrypt.checkpw(password.encode('UTF-9'),row['hashed_password'].encode('UTF-8')):   #4. 3에서 읽어들인 사용자의 암호화된 이메일과  2에서 읽어들인 사용자의 비밀번호가 일치하는지 확인하는 부분.
-        user_id = row['id']
-        payload = {                                                                               #5. 사용자의 데이터베이스상의 아이디, JWT의 유효기간 설정.
-            'user_id' : user_id,
-            'exp'     : detetime.utcnow() + timedelta(seconds = 60 * 60* 24)
-        }
-        token  =  jwt.encode(payload, app.config['JWT_SECRET_KEY'], 'HS256')
-                                                                                #6. 5에서 생성한 payload JSON 데이터를 JWT로 생성한다.
-        return jsonify({
-            'access_token': token.decode('UTF-8')                               #7. 6에서 생성한 JWT를 HTTP응답으로 전송한다.
-        })
+    return [{
+        'user_id' : tweet['user_id'],
+        'tweet'   : tweet['tweet']
+    } for tweet in timeline]
+
+def get_user_id_and_password(email):
+    row = current_app.database.execute(text("""    
+        SELECT
+            id,
+            hashed_password
+        FROM users
+        WHERE email = :email
+    """), {'email' : email}).fetchone()
+
+    return {
+        'id'              : row['id'],
+        'hashed_password' : row['hashed_password']
+    } if row else None
+
+#########################################################
+#       Decorators
+#########################################################
+def login_required(f):      
+    @wraps(f)                   
+    def decorated_function(*args, **kwargs):
+        access_token = request.headers.get('Authorization') 
+        if access_token is not None:  
+            try:
+                payload = jwt.decode(access_token, current_app.config['JWT_SECRET_KEY'], 'HS256') 
+            except jwt.InvalidTokenError:
+                 payload = None     
+
+            if payload is None: return Response(status=401)  
+
+            user_id   = payload['user_id']  
+            g.user_id = user_id
+            g.user    = get_user(user_id) if user_id else None
+        else:
+            return Response(status = 401)  
+
+        return f(*args, **kwargs)
+    return decorated_function
+
+def create_app(test_config = None):
+    app = Flask(__name__)
+
+    app.json_encoder = CustomJSONEncoder
+
+    if test_config is None:
+        app.config.from_pyfile("config.py")
     else:
-        return '', 401                                                          #8. 만일 4에서 사용자가 존재하지 않거나 사용자의 비밀번호가 틀리면 Unauthorized 401 status의 HTTP 응답을 보낸다.
-@app.route('/tweet', methods = ['POST'])    
-def tweet():
-    payload = request.json
-    user_id = int(payload['id'])
-    tweet   = payload['tweet']
+        app.config.update(test_config)
 
-    if user_id not in app.users:
-        return '유저가 존재하지 않습니다', 400
+    database     = create_engine(app.config['DB_URL'], encoding = 'utf-8', max_overflow = 0)
+    app.database = database
 
-    if len(tweet) > 300:
-        return '300자를 초과했습니다', 400
+    @app.route("/ping", methods=['GET'])
+    def ping():
+        return "pong"
 
-    user_id = int(payload['id'])
+    @app.route("/sign-up", methods=['POST'])
+    def sign_up():
+        new_user    = request.json
+        new_user['password'] = bcrypt.hashpw(
+            new_user['password'].encode('UTF-8'),
+            bcrypt.gensalt()
+        )
 
-    app.twwets.append({
-        'user_id': user_id,
-        'tweet' : tweet
-    })
-    
-    return '', 200
+        new_user_id = insert_user(new_user)
+        new_user    = get_user(new_user_id)
 
-@app.route('/follow', methods = ['POST'])
-def follow():
-    payload         = request.json
-    user_id         = int(payload['id'])
-    user_id_to_follow = int(payload['follow'])
+        return jsonify(new_user)
+        
+    @app.route('/login', methods=['POST'])
+    def login():
+        credential      = request.json
+        email           = credential['email']
+        password        = credential['password']
+        user_credential = get_user_id_and_password(email)
 
-    if user_id not in app.users or users_id_to_follow not in app.users:
-        return '유저가 존재하지 않습니다', 400
+        if user_credential and bcrypt.checkpw(password.encode('UTF-8'), user_credential['hashed_password'].encode('UTF-8')): 
+            user_id = user_credential['id'] 
+            payload = {     
+                'user_id' : user_id,
+                'exp'     : datetime.utcnow() + timedelta(seconds = 60 * 60 * 24)
+            }
+            token = jwt.encode(payload, app.config['JWT_SECRET_KEY'], 'HS256') 
 
-    user = app.users[user_id]
-    user.setdefault('follow', set()).add(user_id_to_follow)
+            return jsonify({        
+                'access_token' : token.decode('UTF-8')
+            })
+        else:
+            return '', 401
 
-    return jsonify(user)
+    @app.route('/tweet', methods=['POST'])
+    @login_required
+    def tweet():
+        user_tweet       = request.json
+        user_tweet['id'] = g.user_id
+        tweet            = user_tweet['tweet']
 
-@app.route("/unfollow", methods = ['POST'])
-def unfollow():
-    payload         = request.json
-    user_id         = int(payload['id'])
-    user_id_to_follow = int(payload['unfollow'])
+        if len(tweet) > 300:
+            return '300자를 초과했습니다', 400
 
-    if user_id not in app.users or users_id_to_follow not in app.users:
-        return '유저가 존재하지 않습니다', 400
+        insert_tweet(user_tweet)
 
-    user = app.users[user_id]
-    user.setdefault('follow', set()).discard(user_id_to_follow)
+        return '', 200
 
-    return jsonify(user)
+    @app.route('/follow', methods=['POST'])
+    @login_required
+    def follow():
+        payload       = request.json
+        payload['id'] = g.user_id
 
+        insert_follow(payload) 
 
-@app.route("/timeline/<int:user_id>", methods = ['GET'])
-def timeline(user_id):
-    if user_id not in app.users:
-        return '유저가 존재하지 않습니다', 400
+        return '', 200
 
-    follow_list = app.users[user_id].get('follow', set())
-    follow_list.add(user_id)
-    timeline = [tweet for tweet in app.tweets if tweet['user_id'] in follow_list]
+    @app.route('/unfollow', methods=['POST'])
+    @login_required
+    def unfollow():
+        payload       = request.json
+        payload['id'] = g.user_id
 
-    return jsonify({
-        'user_id': user_id,
-        'timeline': timeline
-    })
+        insert_unfollow(payload)
+
+        return '', 200
+
+    @app.route('/timeline/<int:user_id>', methods=['GET'])
+    def timeline(user_id):
+        return jsonify({
+            'user_id'  : user_id,
+            'timeline' : get_timeline(user_id)
+        })
+
+    return app
+
